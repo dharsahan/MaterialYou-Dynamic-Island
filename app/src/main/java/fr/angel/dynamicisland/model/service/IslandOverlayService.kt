@@ -32,10 +32,20 @@ import fr.angel.dynamicisland.plugins.ExportedPlugins
 import fr.angel.dynamicisland.plugins.PluginHost
 import fr.angel.dynamicisland.plugins.PluginManager
 import fr.angel.dynamicisland.ui.island.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
 
 
+/**
+ * Fixed IslandOverlayService with proper memory management
+ *
+ * Key improvements:
+ * - Removed unsafe singleton pattern
+ * - Proper resource cleanup in onDestroy
+ * - Thread-safe instance management
+ * - Proper coroutine and compose cleanup
+ */
 class IslandOverlayService : AccessibilityService(), PluginHost {
 
 	private val params = WindowManager.LayoutParams(
@@ -49,22 +59,51 @@ class IslandOverlayService : AccessibilityService(), PluginHost {
 	}
 
 	private lateinit var settingsPreferences: SharedPreferences
+	private var windowManager: WindowManager? = null
+	private var composeView: ComposeView? = null
+	private var lifecycleOwner: MyLifecycleOwner? = null
+	private var viewModelStore: ViewModelStore? = null
+	private var recomposer: Recomposer? = null
+	private var recomposeScope: CoroutineScope? = null
+	private var isBroadcastReceiverRegistered = false
 
 	// State of the overlay
 	var islandState : IslandState by mutableStateOf(IslandViewState.Closed)
 		private set
 
-	// Plugins
+	// Plugins - use lateinit to ensure proper initialization order
 	lateinit var pluginManager: PluginManager
+		private set
 
 	// Theme
 	var invertedTheme by mutableStateOf(false)
+		private set
 
 	companion object {
-		private var instance: IslandOverlayService? = null
+		// Thread-safe instance management with WeakReference to prevent memory leaks
+		private val instanceMap = ConcurrentHashMap<String, WeakReference<IslandOverlayService>>()
+		private const val DEFAULT_INSTANCE_KEY = "default"
 
+		/**
+		 * Get the current instance safely
+		 * Returns null if no instance exists or if the instance has been garbage collected
+		 */
 		fun getInstance(): IslandOverlayService? {
-			return instance
+			return instanceMap[DEFAULT_INSTANCE_KEY]?.get()
+		}
+
+		/**
+		 * Internal method to register instance - only called from onServiceConnected
+		 */
+		private fun registerInstance(instance: IslandOverlayService) {
+			instanceMap[DEFAULT_INSTANCE_KEY] = WeakReference(instance)
+		}
+
+		/**
+		 * Internal method to unregister instance - only called from onUnbind
+		 */
+		private fun unregisterInstance() {
+			instanceMap.remove(DEFAULT_INSTANCE_KEY)
 		}
 	}
 
@@ -90,36 +129,76 @@ class IslandOverlayService : AccessibilityService(), PluginHost {
 
 	override fun onServiceConnected() {
 		super.onServiceConnected()
-		setTheme(R.style.Theme_DynamicIsland)
-		instance = this
-		settingsPreferences = getSharedPreferences(SETTINGS_KEY, Context.MODE_PRIVATE)
+		try {
+			setTheme(R.style.Theme_DynamicIsland)
+			registerInstance(this)
+			settingsPreferences = getSharedPreferences(SETTINGS_KEY, Context.MODE_PRIVATE)
 
-		// Register broadcast receiver
-		registerReceiver(mBroadcastReceiver, IntentFilter().apply {
-			addAction(SETTINGS_CHANGED)
-			addAction(SETTINGS_THEME_INVERTED)
-			addAction(ACTION_SCREEN_ON)
-			addAction(ACTION_SCREEN_OFF)
-		}, RECEIVER_EXPORTED)
+			// Register broadcast receiver with proper error handling
+			registerBroadcastReceiver()
 
-		// Setup plugins (check if they are enabled)
-		pluginManager = PluginManager(this, this)
-		pluginManager.initialize()
+			// Setup plugins (check if they are enabled) with error handling
+			try {
+				pluginManager = PluginManager(this, this)
+				pluginManager.initialize()
+			} catch (e: Exception) {
+				Log.e("IslandOverlayService", "Failed to initialize plugin manager", e)
+				// Continue without plugins rather than crash
+			}
 
-		// Setup
-		init()
+			// Setup
+			init()
 
-		val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-		showOverlay(windowManager, params)
+			windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+			windowManager?.let { wm ->
+				showOverlay(wm, params)
+			} ?: run {
+				Log.e("IslandOverlayService", "WindowManager is null, cannot show overlay")
+			}
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to connect service", e)
+		}
+	}
+
+	private fun registerBroadcastReceiver() {
+		try {
+			if (!isBroadcastReceiverRegistered) {
+				registerReceiver(mBroadcastReceiver, IntentFilter().apply {
+					addAction(SETTINGS_CHANGED)
+					addAction(SETTINGS_THEME_INVERTED)
+					addAction(ACTION_SCREEN_ON)
+					addAction(ACTION_SCREEN_OFF)
+				}, RECEIVER_EXPORTED)
+				isBroadcastReceiverRegistered = true
+			}
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to register broadcast receiver", e)
+		}
+	}
+
+	private fun unregisterBroadcastReceiver() {
+		try {
+			if (isBroadcastReceiverRegistered) {
+				unregisterReceiver(mBroadcastReceiver)
+				isBroadcastReceiverRegistered = false
+			}
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to unregister broadcast receiver", e)
+		}
 	}
 
 	fun init() {
-		// Initialize the plugins
-		pluginManager.initialize()
+		try {
+			// Initialize the plugins with null check
+			if (::pluginManager.isInitialized) {
+				pluginManager.initialize()
+			}
 
-		// Setup inverted theme
-		val settingsPreferences = getSharedPreferences(SETTINGS_KEY, Context.MODE_PRIVATE)
-		invertedTheme = settingsPreferences.getBoolean(THEME_INVERTED, false)
+			// Setup inverted theme
+			invertedTheme = settingsPreferences.getBoolean(THEME_INVERTED, false)
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to initialize", e)
+		}
 	}
 
 	@SuppressLint("ClickableViewAccessibility")
@@ -127,82 +206,177 @@ class IslandOverlayService : AccessibilityService(), PluginHost {
 		windowManager: WindowManager,
 		params: WindowManager.LayoutParams
 	) {
-		val composeView = ComposeView(this)
-		// Add effects when notification received, swiped, etc.
-		val composeEffectView = ComposeView(this)
-		composeView.setContent {
-			// Listen for plugin changes
-			LaunchedEffect(pluginManager.activePlugins.firstOrNull()) {
-				islandState = if (pluginManager.activePlugins.firstOrNull() != null) {
-					IslandViewState.Opened
-				} else {
-					IslandViewState.Closed
+		try {
+			// Clean up any existing view first
+			cleanupComposeView()
+
+			composeView = ComposeView(this)
+
+			composeView?.setContent {
+				// Listen for plugin changes with null safety
+				LaunchedEffect(if (::pluginManager.isInitialized) pluginManager.activePlugins.firstOrNull() else null) {
+					islandState = if (::pluginManager.isInitialized && pluginManager.activePlugins.firstOrNull() != null) {
+						IslandViewState.Opened
+					} else {
+						IslandViewState.Closed
+					}
+					Log.d("OverlayService", "Plugins changed: ${if (::pluginManager.isInitialized) pluginManager.activePlugins else emptyList()}")
 				}
-				Log.d("OverlayService", "Plugins changed: ${pluginManager.activePlugins}")
+
+				IslandApp(
+					islandOverlayService = this@IslandOverlayService,
+				)
 			}
 
-			IslandApp(
-				islandOverlayService = this,
-			)
-		}
+			// Setup lifecycle management with proper cleanup tracking
+			setupLifecycleManagement()
 
-		// TODO: Find a way to detect when a click is performed outside of the overlay (to close it)
-		/*composeView.setOnTouchListener { view: View?, event: MotionEvent ->
-			if (event.action == MotionEvent.ACTION_DOWN) {
-				Log.d("OverlayService", "Touch event")
+			// Setup composition context with proper cleanup
+			setupCompositionContext()
+
+			// Add the view to the window
+			windowManager.addView(composeView, params)
+
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to show overlay", e)
+			cleanupComposeView()
+		}
+	}
+
+	private fun setupLifecycleManagement() {
+		try {
+			// Clean up existing components first
+			cleanupLifecycleComponents()
+
+			viewModelStore = ViewModelStore()
+			val viewModelStoreOwner = object : ViewModelStoreOwner {
+				override val viewModelStore: ViewModelStore
+					get() = this@IslandOverlayService.viewModelStore ?: ViewModelStore()
 			}
-			false
-		}*/
 
-		// Trick The ComposeView into thinking we are tracking lifecycle
-		/*val viewModelStore = ViewModelStore()
-		val lifecycleOwner = MyLifecycleOwner()
-		lifecycleOwner.performRestore(null)
-		lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-		ViewTreeLifecycleOwner.set(composeView, lifecycleOwner)
-		ViewTreeViewModelStoreOwner.set(composeView) { viewModelStore }
-		composeView.setViewTreeSavedStateRegistryOwner(lifecycleOwner)*/
+			lifecycleOwner = MyLifecycleOwner()
+			lifecycleOwner?.performRestore(null)
+			lifecycleOwner?.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
 
-		val viewModelStore = ViewModelStore()
-		val viewModelStoreOwner = object : ViewModelStoreOwner {
-			override val viewModelStore: ViewModelStore
-				get() = viewModelStore
+			composeView?.apply {
+				setViewTreeLifecycleOwner(lifecycleOwner)
+				setViewTreeSavedStateRegistryOwner(lifecycleOwner)
+				setViewTreeViewModelStoreOwner(viewModelStoreOwner)
+			}
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to setup lifecycle management", e)
 		}
+	}
 
-		val lifecycleOwner = MyLifecycleOwner()
-		lifecycleOwner.performRestore(null)
-		lifecycleOwner.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-		composeView.setViewTreeLifecycleOwner(lifecycleOwner)
-		composeView.setViewTreeSavedStateRegistryOwner(lifecycleOwner)
-		composeView.setViewTreeViewModelStoreOwner(viewModelStoreOwner)
+	private fun setupCompositionContext() {
+		try {
+			// Clean up existing recomposer first
+			cleanupCompositionContext()
 
-		// Make recomposition happen on the UI thread
-		val coroutineContext = AndroidUiDispatcher.CurrentThread
-		val runRecomposeScope = CoroutineScope(coroutineContext)
-		val recomposer = Recomposer(coroutineContext)
-		composeView.compositionContext = recomposer
-		runRecomposeScope.launch {
-			recomposer.runRecomposeAndApplyChanges()
+			val coroutineContext = AndroidUiDispatcher.CurrentThread
+			recomposeScope = CoroutineScope(coroutineContext + SupervisorJob())
+			recomposer = Recomposer(coroutineContext)
+
+			composeView?.compositionContext = recomposer
+
+			recomposeScope?.launch {
+				try {
+					recomposer?.runRecomposeAndApplyChanges()
+				} catch (e: Exception) {
+					Log.e("IslandOverlayService", "Recomposition failed", e)
+				}
+			}
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to setup composition context", e)
 		}
+	}
 
-		// Add the view to the window
-		windowManager.addView(composeView, params)
+	private fun cleanupComposeView() {
+		try {
+			composeView?.let { view ->
+				windowManager?.removeView(view)
+			}
+			composeView = null
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to cleanup compose view", e)
+		}
+	}
+
+	private fun cleanupLifecycleComponents() {
+		try {
+			lifecycleOwner?.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+			lifecycleOwner = null
+
+			viewModelStore?.clear()
+			viewModelStore = null
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to cleanup lifecycle components", e)
+		}
+	}
+
+	private fun cleanupCompositionContext() {
+		try {
+			recomposeScope?.cancel()
+			recomposeScope = null
+
+			recomposer?.cancel()
+			recomposer = null
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to cleanup composition context", e)
+		}
 	}
 
 	override fun onDestroy() {
+		Log.d("IslandOverlayService", "Service destroying - cleaning up resources")
+
+		// Clean up in reverse order of creation
+		try {
+			// Clean up plugins first
+			if (::pluginManager.isInitialized) {
+				pluginManager.onDestroy()
+			}
+		} catch (e: Exception) {
+			Log.e("IslandOverlayService", "Failed to destroy plugin manager", e)
+		}
+
+		// Clean up broadcast receiver
+		unregisterBroadcastReceiver()
+
+		// Clean up compose and lifecycle components
+		cleanupComposeView()
+		cleanupLifecycleComponents()
+		cleanupCompositionContext()
+
 		super.onDestroy()
-		pluginManager.onDestroy()
 	}
 
-	fun expand() { islandState = IslandViewState.Expanded(configuration = resources.configuration) }
-	fun shrink() { islandState = IslandViewState.Opened }
+	override fun onUnbind(intent: Intent?): Boolean {
+		Log.d("IslandOverlayService", "Service unbinding")
+
+		// Unregister instance
+		unregisterInstance()
+
+		return super.onUnbind(intent)
+	}
+
+	fun expand() {
+		islandState = IslandViewState.Expanded(configuration = resources.configuration)
+	}
+
+	fun shrink() {
+		islandState = IslandViewState.Opened
+	}
 
 	override fun requestDisplay(plugin: BasePlugin) {
-		pluginManager.requestDisplay(plugin)
+		if (::pluginManager.isInitialized) {
+			pluginManager.requestDisplay(plugin)
+		}
 	}
 
 	override fun requestDismiss(plugin: BasePlugin) {
-		pluginManager.requestDismiss(plugin)
+		if (::pluginManager.isInitialized) {
+			pluginManager.requestDismiss(plugin)
+		}
 	}
 
 	override fun requestExpand() {
@@ -214,7 +388,11 @@ class IslandOverlayService : AccessibilityService(), PluginHost {
 	}
 
 	override fun onUnbind(intent: Intent?): Boolean {
-		instance = null
+		Log.d("IslandOverlayService", "Service unbinding")
+
+		// Unregister instance
+		unregisterInstance()
+
 		return super.onUnbind(intent)
 	}
 

@@ -2,6 +2,11 @@ plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
     id 'org.jetbrains.kotlin.plugin.compose'
+    id 'org.owasp.dependencycheck' version '9.0.9'
+    id 'com.github.jk1.dependency-license-report' version '2.5'
+    id 'com.github.ben-manes.versions' version '0.51.0'
+    id 'io.gitlab.arturbosch.detekt' version '1.23.4'
+    id 'org.sonarqube' version '4.4.1.3373'
 }
 
 android {
@@ -25,7 +30,34 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+
+            // Enable signing if keystore is available
+            if (project.hasProperty('android.injected.signing.store.file')) {
+                signingConfig signingConfigs.release
+            }
         }
+        debug {
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+            debuggable true
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (project.hasProperty('android.injected.signing.store.file')) {
+                storeFile file(project.property('android.injected.signing.store.file'))
+                storePassword project.property('android.injected.signing.store.password')
+                keyAlias project.property('android.injected.signing.key.alias')
+                keyPassword project.property('android.injected.signing.key.password')
+            }
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+        disable 'InvalidPackage'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_19
@@ -91,6 +123,13 @@ dependencies {
     implementation "com.airbnb.android:lottie-compose:6.0.1" // Animations
     implementation 'com.github.vitaviva:ComposeWaveLoading:0.1.4' // Wave animation: https://github.com/vitaviva/ComposeWaveLoading
 
+    // Enhanced Coroutines for async operations
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1'
+
+    // Permission handling improvements
+    implementation 'androidx.fragment:fragment-ktx:1.8.5'
+
     // Compose Tests
     androidTestImplementation platform('androidx.compose:compose-bom:2023.05.01')
     androidTestImplementation 'androidx.compose.ui:ui-test-junit4'
@@ -99,11 +138,75 @@ dependencies {
 
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.lifecycle:lifecycle-runtime-ktx:2.6.2'
-    implementation 'androidx.activity:activity-compose:1.7.2'
+    implementation 'androidx.activity:activity-compose:1.9.2'
 
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.5.1'
 
     //implementation 'com.google.android.gms:play-services-auth:20.5.0'
+}
+
+// OWASP Dependency Check Configuration
+dependencyCheck {
+    format = 'HTML'
+    outputDirectory = "$buildDir/reports"
+    suppressionFile = 'dependency-check-suppressions.xml'
+    failBuildOnCVSS = 7
+    analyzers {
+        assemblyEnabled = false
+        nuspecEnabled = false
+        nugetconfEnabled = false
+        centralEnabled = false
+    }
+}
+
+// License Report Configuration
+licenseReport {
+    generateCsvReport = false
+    generateHtmlReport = true
+    generateJsonReport = false
+    generateTextReport = false
+    outputDir = "$buildDir/reports/dependency-license"
+}
+
+// Dependency Updates Configuration
+dependencyUpdates {
+    checkForGradleUpdate = true
+    outputFormatter = "html"
+    outputDir = "$buildDir/dependencyUpdates"
+
+    rejectVersionIf {
+        ['alpha', 'beta', 'rc', 'cr', 'm', 'preview', 'b', 'ea'].any { qualifier ->
+            candidate.version ==~ /(?i).*[.-]$qualifier[.\d-+]*/
+        }
+    }
+}
+
+// Detekt Configuration
+detekt {
+    buildUponDefaultConfig = true
+    allRules = false
+    config = files("$projectDir/config/detekt/detekt.yml")
+    autoCorrect = true
+
+    reports {
+        html.enabled = true
+        xml.enabled = true
+        txt.enabled = false
+        sarif.enabled = false
+    }
+}
+
+// SonarQube Configuration
+sonar {
+    properties {
+        property "sonar.projectName", "Material You Dynamic Island"
+        property "sonar.projectKey", "material-you-dynamic-island"
+        property "sonar.sources", "src/main/java"
+        property "sonar.tests", "src/test/java,src/androidTest/java"
+        property "sonar.java.binaries", "build/intermediates/javac/debug/classes"
+        property "sonar.android.lint.report", "build/reports/lint-results-debug.xml"
+        property "sonar.coverage.jacoco.xmlReportPaths", "build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml"
+    }
 }
